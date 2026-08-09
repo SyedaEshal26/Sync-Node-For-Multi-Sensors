@@ -1,0 +1,7 @@
+# config/sync_node_params.yaml
+sync_node:
+  ros__parameters:
+    sync_time_tolerance: 0.1        # Maximum time difference (seconds)
+    sensor_stale_threshold: 1.0     # Stale threshold (seconds)
+    buffer_size: 30                 # Buffer size for each sensor
+    sync_interval: 0.05            # Sync attempt interval (seconds)

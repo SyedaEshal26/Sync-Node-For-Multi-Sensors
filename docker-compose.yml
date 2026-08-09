@@ -1,0 +1,15 @@
+services:
+  sync_node:
+    build: .
+    image: sync_node_pkg:v2
+    container_name: sync_node_container
+    network_mode: "host"
+    command: >
+      ros2 run sync_node_pkg sync_node_v2 --ros-args
+      -r /reach/fix:=/fix
+      -r /zed2i/image_raw:=/zed/zed_node/rgb/image_rect_color
+      -p camera_stale_threshold_sec:=0.05
+      -p max_buffer_size:=90
+      -p gps_buffer_max_size:=30
+    stdin_open: true
+    tty: true

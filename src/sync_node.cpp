@@ -1,7 +1,11 @@
 #include "sync_node_pkg/sync_node.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <iomanip>
+#include <sstream>
+#include <filesystem>
 
 namespace sync_node_pkg
 {
@@ -9,440 +13,1302 @@ namespace sync_node_pkg
 SyncNode::SyncNode()
 : Node("sync_node")
 {
-  this->declare_parameter<double>("camera_stale_threshold_sec", 0.1);
-  this->declare_parameter<double>("lidar_stale_threshold_sec", 0.1);
-  this->declare_parameter<int>("max_buffer_size", 30);
-  this->declare_parameter<int>("gps_buffer_size", 20);
+  // ============================================================
+  // Parameters
+  // ============================================================
 
-  camera_stale_threshold_sec_ = this->get_parameter("camera_stale_threshold_sec").as_double();
-  lidar_stale_threshold_sec_  = this->get_parameter("lidar_stale_threshold_sec").as_double();
-  max_buffer_size_ = static_cast<size_t>(this->get_parameter("max_buffer_size").as_int());
-  gps_buffer_size_ = static_cast<size_t>(this->get_parameter("gps_buffer_size").as_int());
+  declare_parameter<int>("max_buffer_size", 300);
+  declare_parameter<int>("gps_buffer_size", 100);
 
-  camera_cb_group_   = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-  lidar_cb_group_    = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-  gps_cb_group_      = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
-  zed_core_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  declare_parameter<double>("max_camera_delta_sec", 0.10);
+  declare_parameter<double>("max_lidar_delta_sec", 1.50);
+  declare_parameter<double>("max_imu_delta_sec", 0.05);
+  declare_parameter<double>("max_depth_delta_sec", 0.20);
+  declare_parameter<double>("max_odom_delta_sec", 0.10);
+  declare_parameter<double>("max_gps_delta_sec", 5.0);
 
-  rclcpp::SubscriptionOptions camera_opts; camera_opts.callback_group = camera_cb_group_;
-  rclcpp::SubscriptionOptions lidar_opts;  lidar_opts.callback_group  = lidar_cb_group_;
-  rclcpp::SubscriptionOptions gps_opts;    gps_opts.callback_group    = gps_cb_group_;
-  rclcpp::SubscriptionOptions zed_core_opts; zed_core_opts.callback_group = zed_core_cb_group_;
+  declare_parameter<std::string>(
+    "output_directory",
+    "/home/eshal/ros2_ws/src/sync_node_pkg/sync_data");
 
-  camera_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-    "/zed/zed_node/rgb/image_rect_color", rclcpp::SensorDataQoS(),
-    std::bind(&SyncNode::camera_callback, this, std::placeholders::_1), camera_opts);
+  max_buffer_size_ =
+    static_cast<size_t>(get_parameter("max_buffer_size").as_int());
 
-  lidar_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-    "/rslidar_points", rclcpp::SensorDataQoS(),
-    std::bind(&SyncNode::lidar_callback, this, std::placeholders::_1), lidar_opts);
+  gps_buffer_size_ =
+    static_cast<size_t>(get_parameter("gps_buffer_size").as_int());
 
-  gps_sub_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
-    "/fix", rclcpp::SensorDataQoS(),
-    std::bind(&SyncNode::gps_callback, this, std::placeholders::_1), gps_opts);
+  max_camera_delta_sec_ =
+    get_parameter("max_camera_delta_sec").as_double();
 
-  heading_sub_ = this->create_subscription<geometry_msgs::msg::QuaternionStamped>(
-    "/heading", rclcpp::SensorDataQoS(),
-    std::bind(&SyncNode::heading_callback, this, std::placeholders::_1), gps_opts);
+  max_lidar_delta_sec_ =
+    get_parameter("max_lidar_delta_sec").as_double();
 
-  imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
-    "/zed/zed_node/imu/data", rclcpp::SensorDataQoS(),
-    std::bind(&SyncNode::imu_callback, this, std::placeholders::_1), zed_core_opts);
+  max_imu_delta_sec_ =
+    get_parameter("max_imu_delta_sec").as_double();
 
-  depth_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-    "/zed/zed_node/depth/depth_registered", rclcpp::SensorDataQoS(),
-    std::bind(&SyncNode::depth_callback, this, std::placeholders::_1), zed_core_opts);
+  max_depth_delta_sec_ =
+    get_parameter("max_depth_delta_sec").as_double();
 
-  odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-    "/zed/zed_node/odom", rclcpp::SensorDataQoS(),
-    std::bind(&SyncNode::odom_callback, this, std::placeholders::_1), zed_core_opts);
+  max_odom_delta_sec_ =
+    get_parameter("max_odom_delta_sec").as_double();
 
-  synced_camera_pub_ = this->create_publisher<sensor_msgs::msg::Image>("/synced/camera", 10);
-  synced_lidar_pub_  = this->create_publisher<sensor_msgs::msg::PointCloud2>("/synced/lidar", 10);
-  synced_gps_pub_    = this->create_publisher<sensor_msgs::msg::NavSatFix>("/synced/gps", 10);
-  synced_imu_pub_    = this->create_publisher<sensor_msgs::msg::Imu>("/synced/zed/imu", 10);
-  synced_heading_pub_ = this->create_publisher<geometry_msgs::msg::QuaternionStamped>("/synced/heading", 10);
-  synced_depth_pub_  = this->create_publisher<sensor_msgs::msg::Image>("/synced/zed/depth_registered", 10);
-  synced_odom_pub_   = this->create_publisher<nav_msgs::msg::Odometry>("/synced/zed/odom", 10);
-  status_pub_        = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>("/synced/status", 10);
-  loss_stats_pub_    = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>("/synced/loss_stats", 1);
+  max_gps_delta_sec_ =
+    get_parameter("max_gps_delta_sec").as_double();
 
-  stats_timer_ = this->create_wall_timer(
-    std::chrono::seconds(5), std::bind(&SyncNode::log_stats, this));
+  output_directory_ =
+    get_parameter("output_directory").as_string();
 
-  RCLCPP_INFO(this->get_logger(),
-    "SyncNode Active: single camera-driven trigger, zero-copy buffers, per-modality monotonic guard.");
+  // ============================================================
+  // Create output directory
+  // ============================================================
+
+  try {
+    std::filesystem::create_directories(output_directory_);
+  } catch (const std::exception & e) {
+    RCLCPP_ERROR(
+      get_logger(),
+      "Could not create output directory: %s",
+      e.what());
+  }
+
+  // ============================================================
+  // CSV
+  // ============================================================
+
+  const std::string csv_path =
+    output_directory_ + "/sync_statistics.csv";
+
+  csv_file_.open(csv_path, std::ios::out | std::ios::trunc);
+
+  if (!csv_file_.is_open()) {
+    RCLCPP_ERROR(
+      get_logger(),
+      "Could not open CSV: %s",
+      csv_path.c_str());
+  } else {
+
+    csv_file_
+      << "wall_time,"
+      << "fusion_id,"
+      << "trigger_source,"
+      << "trigger_stamp,"
+      << "camera_found,"
+      << "lidar_found,"
+      << "gps_found,"
+      << "gps_interpolated,"
+      << "imu_found,"
+      << "depth_found,"
+      << "odom_found,"
+      << "camera_delta_ms,"
+      << "lidar_delta_ms,"
+      << "imu_delta_ms,"
+      << "depth_delta_ms,"
+      << "odom_delta_ms,"
+      << "gps_delta_ms,"
+      << "fusion_latency_ms\n";
+
+    csv_file_.flush();
+  }
+
+  // ============================================================
+  // Callback groups
+  // ============================================================
+
+  camera_cb_group_ =
+    create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+
+  lidar_cb_group_ =
+    create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+
+  gps_cb_group_ =
+    create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+
+  imu_cb_group_ =
+    create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+
+  depth_cb_group_ =
+    create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+
+  odom_cb_group_ =
+    create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+
+  heading_cb_group_ =
+    create_callback_group(
+      rclcpp::CallbackGroupType::MutuallyExclusive);
+
+  rclcpp::SubscriptionOptions camera_opts;
+  camera_opts.callback_group = camera_cb_group_;
+
+  rclcpp::SubscriptionOptions lidar_opts;
+  lidar_opts.callback_group = lidar_cb_group_;
+
+  rclcpp::SubscriptionOptions gps_opts;
+  gps_opts.callback_group = gps_cb_group_;
+
+  rclcpp::SubscriptionOptions imu_opts;
+  imu_opts.callback_group = imu_cb_group_;
+
+  rclcpp::SubscriptionOptions depth_opts;
+  depth_opts.callback_group = depth_cb_group_;
+
+  rclcpp::SubscriptionOptions odom_opts;
+  odom_opts.callback_group = odom_cb_group_;
+
+  rclcpp::SubscriptionOptions heading_opts;
+  heading_opts.callback_group = heading_cb_group_;
+
+  // ============================================================
+  // Subscriptions
+  // ============================================================
+
+  camera_sub_ =
+    create_subscription<ImageMsg>(
+      "/zed/zed_node/rgb/image_rect_color",
+      rclcpp::SensorDataQoS(),
+      std::bind(
+        &SyncNode::camera_callback,
+        this,
+        std::placeholders::_1),
+      camera_opts);
+
+  lidar_sub_ =
+    create_subscription<PointCloudMsg>(
+      "/rslidar_points",
+      rclcpp::SensorDataQoS(),
+      std::bind(
+        &SyncNode::lidar_callback,
+        this,
+        std::placeholders::_1),
+      lidar_opts);
+
+  gps_sub_ =
+    create_subscription<NavSatFixMsg>(
+      "/fix",
+      rclcpp::SensorDataQoS(),
+      std::bind(
+        &SyncNode::gps_callback,
+        this,
+        std::placeholders::_1),
+      gps_opts);
+
+  imu_sub_ =
+    create_subscription<ImuMsg>(
+      "/zed/zed_node/imu/data",
+      rclcpp::SensorDataQoS(),
+      std::bind(
+        &SyncNode::imu_callback,
+        this,
+        std::placeholders::_1),
+      imu_opts);
+
+  depth_sub_ =
+    create_subscription<ImageMsg>(
+      "/zed/zed_node/depth/depth_registered",
+      rclcpp::SensorDataQoS(),
+      std::bind(
+        &SyncNode::depth_callback,
+        this,
+        std::placeholders::_1),
+      depth_opts);
+
+  odom_sub_ =
+    create_subscription<OdometryMsg>(
+      "/zed/zed_node/odom",
+      rclcpp::SensorDataQoS(),
+      std::bind(
+        &SyncNode::odom_callback,
+        this,
+        std::placeholders::_1),
+      odom_opts);
+
+  heading_sub_ =
+    create_subscription<HeadingMsg>(
+      "/heading",
+      rclcpp::SensorDataQoS(),
+      std::bind(
+        &SyncNode::heading_callback,
+        this,
+        std::placeholders::_1),
+      heading_opts);
+
+  // ============================================================
+  // Publishers
+  // ============================================================
+
+  synced_camera_pub_ =
+    create_publisher<ImageMsg>("/synced/camera", 10);
+
+  synced_lidar_pub_ =
+    create_publisher<PointCloudMsg>("/synced/lidar", 10);
+
+  synced_gps_pub_ =
+    create_publisher<NavSatFixMsg>("/synced/gps", 10);
+
+  synced_imu_pub_ =
+    create_publisher<ImuMsg>("/synced/zed/imu", 10);
+
+  synced_depth_pub_ =
+    create_publisher<ImageMsg>(
+      "/synced/zed/depth_registered", 10);
+
+  synced_odom_pub_ =
+    create_publisher<OdometryMsg>(
+      "/synced/zed/odom", 10);
+
+  synced_heading_pub_ =
+    create_publisher<HeadingMsg>(
+      "/synced/heading", 10);
+
+  status_pub_ =
+    create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(
+      "/synced/status", 10);
+
+  loss_stats_pub_ =
+    create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(
+      "/synced/loss_stats", 10);
+
+  // ============================================================
+  // Statistics timer
+  // ============================================================
+
+  stats_timer_ =
+    create_wall_timer(
+      std::chrono::seconds(5),
+      std::bind(&SyncNode::log_stats, this));
+
+  // ============================================================
+  // Startup
+  // ============================================================
+
+  RCLCPP_INFO(
+    get_logger(),
+    "==============================================");
+
+  RCLCPP_INFO(
+    get_logger(),
+    "SyncNode started");
+
+  RCLCPP_INFO(
+    get_logger(),
+    "Camera + LiDAR trigger fusion");
+
+  RCLCPP_INFO(
+    get_logger(),
+    "Buffered nearest-timestamp synchronization");
+
+  RCLCPP_INFO(
+    get_logger(),
+    "GPS interpolation enabled");
+
+  RCLCPP_INFO(
+    get_logger(),
+    "CSV output: %s",
+    csv_path.c_str());
+
+  RCLCPP_INFO(
+    get_logger(),
+    "==============================================");
 }
 
-// ---------------------------------------------------------------------------
-// Callbacks
-// ---------------------------------------------------------------------------
+// ================================================================
+// Destructor
+// ================================================================
 
-void SyncNode::camera_callback(const ImageMsg::SharedPtr msg)
+SyncNode::~SyncNode()
+{
+  std::lock_guard<std::mutex> lock(csv_mutex_);
+
+  if (csv_file_.is_open()) {
+    csv_file_.flush();
+    csv_file_.close();
+  }
+}
+
+// ================================================================
+// Timestamp difference
+// ================================================================
+
+double SyncNode::timestamp_difference(
+  const rclcpp::Time & a,
+  const rclcpp::Time & b) const
+{
+  return std::abs((a - b).seconds());
+}
+
+// ================================================================
+// Camera callback
+// ================================================================
+
+void SyncNode::camera_callback(
+  const ImageMsg::SharedPtr msg)
 {
   {
     std::lock_guard<std::mutex> lock(camera_mutex_);
-    camera_buffer_.push_back(msg);  // shared_ptr copy only — no payload copy
-    if (camera_buffer_.size() > max_buffer_size_) camera_buffer_.pop_front();
+
+    camera_buffer_.push_back(msg);
+
+    if (camera_buffer_.size() > max_buffer_size_) {
+      camera_buffer_.pop_front();
+      camera_buffer_drops_++;
+    }
   }
+
   camera_received_++;
 
-  // Camera is the sole fusion trigger. camera_callback() is serialized
-  // against itself by its own MutuallyExclusive callback group, so
-  // trigger_fusion() can never run concurrently with itself and needs no
-  // extra global lock.
-  trigger_fusion(msg->header.stamp, "camera");
+  trigger_fusion(
+    rclcpp::Time(msg->header.stamp),
+    "camera");
 }
 
-void SyncNode::lidar_callback(const PointCloudMsg::SharedPtr msg)
+// ================================================================
+// LiDAR callback
+// ================================================================
+
+void SyncNode::lidar_callback(
+  const PointCloudMsg::SharedPtr msg)
 {
-  std::lock_guard<std::mutex> lock(lidar_mutex_);
-  lidar_buffer_.push_back(msg);
-  if (lidar_buffer_.size() > max_buffer_size_) lidar_buffer_.pop_front();
+  {
+    std::lock_guard<std::mutex> lock(lidar_mutex_);
+
+    lidar_buffer_.push_back(msg);
+
+    if (lidar_buffer_.size() > max_buffer_size_) {
+      lidar_buffer_.pop_front();
+      lidar_buffer_drops_++;
+    }
+  }
+
   lidar_received_++;
-  // No trigger_fusion() call here anymore — lidar only feeds the buffer that
-  // the camera-driven trigger reads from.
+
+  trigger_fusion(
+    rclcpp::Time(msg->header.stamp),
+    "lidar");
 }
 
-void SyncNode::gps_callback(const NavSatFixMsg::SharedPtr msg)
+// ================================================================
+// GPS callback
+// ================================================================
+
+void SyncNode::gps_callback(
+  const NavSatFixMsg::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(gps_mutex_);
+
   gps_buffer_.push_back(msg);
-  if (gps_buffer_.size() > gps_buffer_size_) gps_buffer_.pop_front();
+
+  if (gps_buffer_.size() > gps_buffer_size_) {
+    gps_buffer_.pop_front();
+    gps_buffer_drops_++;
+  }
+
   gps_received_++;
-  // No trigger_fusion() call here either — same reasoning as lidar.
 }
 
-void SyncNode::heading_callback(const HeadingMsg::SharedPtr msg)
-{
-  std::lock_guard<std::mutex> lock(heading_mutex_);
-  latest_heading_ = msg; heading_received_ = true;
-}
+// ================================================================
+// IMU callback
+// ================================================================
 
-void SyncNode::imu_callback(const ImuMsg::SharedPtr msg)
+void SyncNode::imu_callback(
+  const ImuMsg::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(imu_mutex_);
-  latest_imu_ = msg; imu_received_ = true;
+
+  imu_buffer_.push_back(msg);
+
+  if (imu_buffer_.size() > max_buffer_size_) {
+    imu_buffer_.pop_front();
+    imu_buffer_drops_++;
+  }
+
+  imu_received_++;
 }
 
-void SyncNode::depth_callback(const ImageMsg::SharedPtr msg)
+// ================================================================
+// Depth callback
+// ================================================================
+
+void SyncNode::depth_callback(
+  const ImageMsg::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(depth_mutex_);
-  latest_depth_ = msg; depth_received_ = true;
+
+  depth_buffer_.push_back(msg);
+
+  if (depth_buffer_.size() > max_buffer_size_) {
+    depth_buffer_.pop_front();
+    depth_buffer_drops_++;
+  }
+
+  depth_received_++;
 }
 
-void SyncNode::odom_callback(const OdometryMsg::SharedPtr msg)
+// ================================================================
+// Odom callback
+// ================================================================
+
+void SyncNode::odom_callback(
+  const OdometryMsg::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(odom_mutex_);
-  latest_odom_ = msg; odom_received_ = true;
+
+  odom_buffer_.push_back(msg);
+
+  if (odom_buffer_.size() > max_buffer_size_) {
+    odom_buffer_.pop_front();
+    odom_buffer_drops_++;
+  }
+
+  odom_received_++;
 }
 
-// ---------------------------------------------------------------------------
-// Robust Anti-Jitter Lookups (With Pruning & Monotonic Checks)
-// ---------------------------------------------------------------------------
+// ================================================================
+// Heading callback
+// ================================================================
+
+void SyncNode::heading_callback(
+  const HeadingMsg::SharedPtr msg)
+{
+  std::lock_guard<std::mutex> lock(heading_mutex_);
+
+  latest_heading_ = msg;
+  heading_received_ = true;
+  heading_received_count_++;
+}
+
+// ================================================================
+// Camera matching
+// ================================================================
 
 bool SyncNode::find_closest_camera(
-  const rclcpp::Time & target, ImageMsg::ConstSharedPtr & result, bool & is_stale)
+  const rclcpp::Time & target,
+  ImageMsg::ConstSharedPtr & result)
 {
   std::lock_guard<std::mutex> lock(camera_mutex_);
-  if (camera_buffer_.empty()) return false;
 
-  // 1. Drop outdated frames older than target window
-  while (camera_buffer_.size() > 1) {
-    double age = (target - rclcpp::Time(camera_buffer_.front()->header.stamp)).seconds();
-    if (age > camera_stale_threshold_sec_) {
-      camera_buffer_.pop_front();
-    } else {
-      break;
-    }
-  }
-
-  // 2. Find closest frame
-  auto closest = std::min_element(
-    camera_buffer_.begin(), camera_buffer_.end(),
-    [&](const ImageMsg::ConstSharedPtr & a, const ImageMsg::ConstSharedPtr & b) {
-      return std::abs((rclcpp::Time(a->header.stamp) - target).seconds()) <
-             std::abs((rclcpp::Time(b->header.stamp) - target).seconds());
-    });
-
-  rclcpp::Time match_stamp((*closest)->header.stamp);
-
-  // 3. Monotonicity Guard: NEVER publish an older/equal frame than what we
-  //    already published. Checked AND updated here, atomically, under
-  //    camera_mutex_ — no separate lock or race window against publish.
-  if (has_published_camera_ && match_stamp <= last_published_camera_stamp_) {
-    return false; // Skip old frames completely to avoid stream glitching
-  }
-
-  double diff = std::abs((match_stamp - target).seconds());
-  is_stale = (diff > camera_stale_threshold_sec_);
-  result = *closest;  // shared_ptr copy — no payload copy
-
-  last_published_camera_stamp_ = match_stamp;
-  has_published_camera_ = true;
-
-  // 4. Prune Buffer: Remove all frames up to matched frame so buffer stays fresh
-  while (!camera_buffer_.empty() && camera_buffer_.begin() != closest) {
-    camera_buffer_.pop_front();
-  }
-
-  return true;
-}
-
-bool SyncNode::find_closest_lidar(
-  const rclcpp::Time & target, PointCloudMsg::ConstSharedPtr & result, bool & is_stale)
-{
-  std::lock_guard<std::mutex> lock(lidar_mutex_);
-  if (lidar_buffer_.empty()) return false;
-
-  // 1. Drop outdated frames
-  while (lidar_buffer_.size() > 1) {
-    double age = (target - rclcpp::Time(lidar_buffer_.front()->header.stamp)).seconds();
-    if (age > lidar_stale_threshold_sec_) {
-      lidar_buffer_.pop_front();
-    } else {
-      break;
-    }
-  }
-
-  // 2. Find closest frame
-  auto closest = std::min_element(
-    lidar_buffer_.begin(), lidar_buffer_.end(),
-    [&](const PointCloudMsg::ConstSharedPtr & a, const PointCloudMsg::ConstSharedPtr & b) {
-      return std::abs((rclcpp::Time(a->header.stamp) - target).seconds()) <
-             std::abs((rclcpp::Time(b->header.stamp) - target).seconds());
-    });
-
-  rclcpp::Time match_stamp((*closest)->header.stamp);
-
-  // 3. Monotonicity Guard (checked + updated atomically under lidar_mutex_)
-  if (has_published_lidar_ && match_stamp <= last_published_lidar_stamp_) {
+  if (camera_buffer_.empty()) {
     return false;
   }
 
-  double diff = std::abs((match_stamp - target).seconds());
-  is_stale = (diff > lidar_stale_threshold_sec_);
-  result = *closest;  // shared_ptr copy — no payload copy (avoids copying a full PointCloud2)
+  auto closest =
+    std::min_element(
+      camera_buffer_.begin(),
+      camera_buffer_.end(),
+      [&](const auto & a, const auto & b)
+      {
+        return timestamp_difference(
+                 rclcpp::Time(a->header.stamp), target)
+             <
+               timestamp_difference(
+                 rclcpp::Time(b->header.stamp), target);
+      });
 
-  last_published_lidar_stamp_ = match_stamp;
-  has_published_lidar_ = true;
+  double delta =
+    timestamp_difference(
+      rclcpp::Time((*closest)->header.stamp),
+      target);
 
-  // 4. Prune Buffer
-  while (!lidar_buffer_.empty() && lidar_buffer_.begin() != closest) {
-    lidar_buffer_.pop_front();
+  if (delta > max_camera_delta_sec_) {
+    return false;
   }
+
+  result = *closest;
+
+  camera_buffer_.erase(closest);
+
+  camera_matched_++;
 
   return true;
 }
 
+// ================================================================
+// LiDAR matching
+// ================================================================
+
+bool SyncNode::find_closest_lidar(
+  const rclcpp::Time & target,
+  PointCloudMsg::ConstSharedPtr & result)
+{
+  std::lock_guard<std::mutex> lock(lidar_mutex_);
+
+  if (lidar_buffer_.empty()) {
+    return false;
+  }
+
+  auto closest =
+    std::min_element(
+      lidar_buffer_.begin(),
+      lidar_buffer_.end(),
+      [&](const auto & a, const auto & b)
+      {
+        return timestamp_difference(
+                 rclcpp::Time(a->header.stamp), target)
+             <
+               timestamp_difference(
+                 rclcpp::Time(b->header.stamp), target);
+      });
+
+  double delta =
+    timestamp_difference(
+      rclcpp::Time((*closest)->header.stamp),
+      target);
+
+  if (delta > max_lidar_delta_sec_) {
+    return false;
+  }
+
+  result = *closest;
+
+  lidar_buffer_.erase(closest);
+
+  lidar_matched_++;
+
+  return true;
+}
+
+// ================================================================
+// IMU matching
+// ================================================================
+
+bool SyncNode::find_closest_imu(
+  const rclcpp::Time & target,
+  ImuMsg::ConstSharedPtr & result)
+{
+  std::lock_guard<std::mutex> lock(imu_mutex_);
+
+  if (imu_buffer_.empty()) {
+    return false;
+  }
+
+  auto closest =
+    std::min_element(
+      imu_buffer_.begin(),
+      imu_buffer_.end(),
+      [&](const auto & a, const auto & b)
+      {
+        return timestamp_difference(
+                 rclcpp::Time(a->header.stamp), target)
+             <
+               timestamp_difference(
+                 rclcpp::Time(b->header.stamp), target);
+      });
+
+  double delta =
+    timestamp_difference(
+      rclcpp::Time((*closest)->header.stamp),
+      target);
+
+  if (delta > max_imu_delta_sec_) {
+    return false;
+  }
+
+  result = *closest;
+
+  imu_buffer_.erase(closest);
+
+  imu_matched_++;
+
+  return true;
+}
+
+// ================================================================
+// Depth matching
+// ================================================================
+
+bool SyncNode::find_closest_depth(
+  const rclcpp::Time & target,
+  ImageMsg::ConstSharedPtr & result)
+{
+  std::lock_guard<std::mutex> lock(depth_mutex_);
+
+  if (depth_buffer_.empty()) {
+    return false;
+  }
+
+  auto closest =
+    std::min_element(
+      depth_buffer_.begin(),
+      depth_buffer_.end(),
+      [&](const auto & a, const auto & b)
+      {
+        return timestamp_difference(
+                 rclcpp::Time(a->header.stamp), target)
+             <
+               timestamp_difference(
+                 rclcpp::Time(b->header.stamp), target);
+      });
+
+  double delta =
+    timestamp_difference(
+      rclcpp::Time((*closest)->header.stamp),
+      target);
+
+  if (delta > max_depth_delta_sec_) {
+    return false;
+  }
+
+  result = *closest;
+
+  depth_buffer_.erase(closest);
+
+  depth_matched_++;
+
+  return true;
+}
+
+// ================================================================
+// Odom matching
+// ================================================================
+
+bool SyncNode::find_closest_odom(
+  const rclcpp::Time & target,
+  OdometryMsg::ConstSharedPtr & result)
+{
+  std::lock_guard<std::mutex> lock(odom_mutex_);
+
+  if (odom_buffer_.empty()) {
+    return false;
+  }
+
+  auto closest =
+    std::min_element(
+      odom_buffer_.begin(),
+      odom_buffer_.end(),
+      [&](const auto & a, const auto & b)
+      {
+        return timestamp_difference(
+                 rclcpp::Time(a->header.stamp), target)
+             <
+               timestamp_difference(
+                 rclcpp::Time(b->header.stamp), target);
+      });
+
+  double delta =
+    timestamp_difference(
+      rclcpp::Time((*closest)->header.stamp),
+      target);
+
+  if (delta > max_odom_delta_sec_) {
+    return false;
+  }
+
+  result = *closest;
+
+  odom_buffer_.erase(closest);
+
+  odom_matched_++;
+
+  return true;
+}
+
+// ================================================================
+// GPS
+// ================================================================
+
 bool SyncNode::get_gps_estimate(
-  const rclcpp::Time & target, NavSatFixMsg::ConstSharedPtr & result, bool & is_interpolated)
+  const rclcpp::Time & target,
+  NavSatFixMsg::ConstSharedPtr & result,
+  bool & interpolated)
 {
   std::lock_guard<std::mutex> lock(gps_mutex_);
-  if (gps_buffer_.empty()) return false;
 
-  // Prune old GPS points older than 5 sec
-  while (gps_buffer_.size() > 2) {
-    if ((target - rclcpp::Time(gps_buffer_.front()->header.stamp)).seconds() > 5.0) {
-      gps_buffer_.pop_front();
-    } else {
-      break;
+  interpolated = false;
+
+  if (gps_buffer_.empty()) {
+    return false;
+  }
+
+  // --------------------------------------------------------------
+  // One GPS sample
+  // --------------------------------------------------------------
+
+  if (gps_buffer_.size() == 1) {
+
+    const auto & msg = gps_buffer_.front();
+
+    double delta =
+      timestamp_difference(
+        rclcpp::Time(msg->header.stamp),
+        target);
+
+    if (delta > max_gps_delta_sec_) {
+      return false;
+    }
+
+    result = msg;
+
+    gps_matched_++;
+    gps_direct_count_++;
+
+    return true;
+  }
+
+  // --------------------------------------------------------------
+  // Find closest GPS sample
+  // --------------------------------------------------------------
+
+  auto closest =
+    std::min_element(
+      gps_buffer_.begin(),
+      gps_buffer_.end(),
+      [&](const auto & a, const auto & b)
+      {
+        return timestamp_difference(
+                 rclcpp::Time(a->header.stamp), target)
+             <
+               timestamp_difference(
+                 rclcpp::Time(b->header.stamp), target);
+      });
+
+  double closest_delta =
+    timestamp_difference(
+      rclcpp::Time((*closest)->header.stamp),
+      target);
+
+  // --------------------------------------------------------------
+  // Interpolation requires bracketing samples
+  // --------------------------------------------------------------
+
+  for (size_t i = 0; i + 1 < gps_buffer_.size(); ++i) {
+
+    auto older = gps_buffer_[i];
+    auto newer = gps_buffer_[i + 1];
+
+    rclcpp::Time t_old(older->header.stamp);
+    rclcpp::Time t_new(newer->header.stamp);
+
+    if (t_old <= target && target <= t_new) {
+
+      double dt =
+        (t_new - t_old).seconds();
+
+      if (dt <= 0.0) {
+        break;
+      }
+
+      double ratio =
+        (target - t_old).seconds() / dt;
+
+      if (ratio < 0.0 || ratio > 1.0) {
+        break;
+      }
+
+      auto gps =
+        std::make_shared<NavSatFixMsg>(*newer);
+
+      gps->latitude =
+        older->latitude +
+        ratio * (newer->latitude - older->latitude);
+
+      gps->longitude =
+        older->longitude +
+        ratio * (newer->longitude - older->longitude);
+
+      gps->altitude =
+        older->altitude +
+        ratio * (newer->altitude - older->altitude);
+
+      gps->header.stamp = target;
+
+      result = gps;
+
+      interpolated = true;
+
+      gps_matched_++;
+      gps_interpolated_count_++;
+
+      return true;
     }
   }
 
-  if (gps_buffer_.size() < 2) {
-    result = gps_buffer_.back();  // shared_ptr copy, no data copy
-    is_interpolated = false;
-    return true;
+  // --------------------------------------------------------------
+  // Otherwise use closest direct GPS
+  // --------------------------------------------------------------
+
+  if (closest_delta > max_gps_delta_sec_) {
+    return false;
   }
 
-  const auto & older = gps_buffer_[gps_buffer_.size() - 2];
-  const auto & newer = gps_buffer_.back();
+  result = *closest;
 
-  double t_old = rclcpp::Time(older->header.stamp).seconds();
-  double t_new = rclcpp::Time(newer->header.stamp).seconds();
-  double t_tgt = target.seconds();
+  gps_matched_++;
+  gps_direct_count_++;
 
-  if (t_tgt >= t_new) {
-    result = newer;  // no interpolation needed — no data copy
-    is_interpolated = false;
-    return true;
-  }
-
-  double ratio = (t_new > t_old) ? (t_tgt - t_old) / (t_new - t_old) : 0.0;
-  ratio = std::clamp(ratio, 0.0, 1.0);
-
-  // Interpolation genuinely needs a new message, so this is the one place we
-  // pay for a copy — unavoidable since we're synthesizing new data.
-  auto interpolated = std::make_shared<NavSatFixMsg>(*newer);
-  interpolated->latitude  = older->latitude  + ratio * (newer->latitude  - older->latitude);
-  interpolated->longitude = older->longitude + ratio * (newer->longitude - older->longitude);
-  interpolated->altitude  = older->altitude  + ratio * (newer->altitude  - older->altitude);
-  result = interpolated;
-  is_interpolated = (ratio > 0.0 && ratio < 1.0);
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Fusion Execution
-// ---------------------------------------------------------------------------
+// ================================================================
+// Fusion
+// ================================================================
 
-void SyncNode::trigger_fusion(const rclcpp::Time & trigger_timestamp, const std::string & trigger_source)
+void SyncNode::trigger_fusion(
+  const rclcpp::Time & timestamp,
+  const std::string & trigger_source)
 {
-  // No fusion_mutex_ here — this function is only called from
-  // camera_callback(), which is already serialized against itself by its
-  // own MutuallyExclusive callback group. lidar/gps callbacks no longer
-  // call this function at all, so there is nothing left to serialize
-  // against.
-  auto t_start = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> fusion_lock(fusion_mutex_);
 
-  ImageMsg::ConstSharedPtr matched_camera;
-  bool camera_stale = false;
-  bool camera_found = find_closest_camera(trigger_timestamp, matched_camera, camera_stale);
+  // Prevent duplicate trigger at essentially same timestamp
+  if (has_last_trigger_) {
 
-  PointCloudMsg::ConstSharedPtr matched_lidar;
-  bool lidar_stale = false;
-  bool lidar_found = find_closest_lidar(trigger_timestamp, matched_lidar, lidar_stale);
+    double dt =
+      std::abs(
+        (timestamp - last_trigger_time_).seconds());
 
-  NavSatFixMsg::ConstSharedPtr gps_output;
-  bool gps_interpolated = false;
-  bool gps_found = get_gps_estimate(trigger_timestamp, gps_output, gps_interpolated);
-
-  ImuMsg::ConstSharedPtr imu_copy;
-  bool imu_found = false;
-  {
-    std::lock_guard<std::mutex> lock(imu_mutex_);
-    if (imu_received_) { imu_copy = latest_imu_; imu_found = true; }
+    if (dt < 0.001) {
+      return;
+    }
   }
 
-  HeadingMsg::ConstSharedPtr heading_copy;
+  last_trigger_time_ = timestamp;
+  has_last_trigger_ = true;
+
+  auto start =
+    std::chrono::steady_clock::now();
+
+  // --------------------------------------------------------------
+  // Match sensors
+  // --------------------------------------------------------------
+
+  ImageMsg::ConstSharedPtr camera;
+  PointCloudMsg::ConstSharedPtr lidar;
+  NavSatFixMsg::ConstSharedPtr gps;
+  ImuMsg::ConstSharedPtr imu;
+  ImageMsg::ConstSharedPtr depth;
+  OdometryMsg::ConstSharedPtr odom;
+  HeadingMsg::ConstSharedPtr heading;
+
+  bool camera_found =
+    find_closest_camera(timestamp, camera);
+
+  bool lidar_found =
+    find_closest_lidar(timestamp, lidar);
+
+  bool gps_interpolated = false;
+
+  bool gps_found =
+    get_gps_estimate(
+      timestamp,
+      gps,
+      gps_interpolated);
+
+  bool imu_found =
+    find_closest_imu(timestamp, imu);
+
+  bool depth_found =
+    find_closest_depth(timestamp, depth);
+
+  bool odom_found =
+    find_closest_odom(timestamp, odom);
+
   bool heading_found = false;
+
   {
     std::lock_guard<std::mutex> lock(heading_mutex_);
-    if (heading_received_) { heading_copy = latest_heading_; heading_found = true; }
+
+    if (heading_received_ && latest_heading_) {
+      heading = latest_heading_;
+      heading_found = true;
+    }
   }
 
-  ImageMsg::ConstSharedPtr depth_copy;
-  bool depth_found = false;
+  // --------------------------------------------------------------
+  // Latency
+  // --------------------------------------------------------------
+
+  auto end =
+    std::chrono::steady_clock::now();
+
+  double latency_ms =
+    std::chrono::duration<double, std::milli>(
+      end - start).count();
+
+  total_fusions_++;
+
   {
-    std::lock_guard<std::mutex> lock(depth_mutex_);
-    if (depth_received_) { depth_copy = latest_depth_; depth_found = true; }
+    std::lock_guard<std::mutex> lock(latency_mutex_);
+
+    latency_sum_ms_ += latency_ms;
+
+    latency_min_ms_ =
+      std::min(latency_min_ms_, latency_ms);
+
+    latency_max_ms_ =
+      std::max(latency_max_ms_, latency_ms);
+
+    latency_count_++;
   }
 
-  OdometryMsg::ConstSharedPtr odom_copy;
-  bool odom_found = false;
+  // --------------------------------------------------------------
+  // Publish
+  // --------------------------------------------------------------
+
+  if (camera_found && camera) {
+    synced_camera_pub_->publish(*camera);
+  }
+
+  if (lidar_found && lidar) {
+    synced_lidar_pub_->publish(*lidar);
+  }
+
+  if (gps_found && gps) {
+    synced_gps_pub_->publish(*gps);
+  }
+
+  if (imu_found && imu) {
+    synced_imu_pub_->publish(*imu);
+  }
+
+  if (depth_found && depth) {
+    synced_depth_pub_->publish(*depth);
+  }
+
+  if (odom_found && odom) {
+    synced_odom_pub_->publish(*odom);
+  }
+
+  if (heading_found && heading) {
+    synced_heading_pub_->publish(*heading);
+  }
+
+  // --------------------------------------------------------------
+  // Timestamp errors
+  // --------------------------------------------------------------
+
+  double camera_delta_ms = -1.0;
+  double lidar_delta_ms = -1.0;
+  double imu_delta_ms = -1.0;
+  double depth_delta_ms = -1.0;
+  double odom_delta_ms = -1.0;
+  double gps_delta_ms = -1.0;
+
+  if (camera_found) {
+    camera_delta_ms =
+      timestamp_difference(
+        rclcpp::Time(camera->header.stamp),
+        timestamp) * 1000.0;
+  }
+
+  if (lidar_found) {
+    lidar_delta_ms =
+      timestamp_difference(
+        rclcpp::Time(lidar->header.stamp),
+        timestamp) * 1000.0;
+  }
+
+  if (imu_found) {
+    imu_delta_ms =
+      timestamp_difference(
+        rclcpp::Time(imu->header.stamp),
+        timestamp) * 1000.0;
+  }
+
+  if (depth_found) {
+    depth_delta_ms =
+      timestamp_difference(
+        rclcpp::Time(depth->header.stamp),
+        timestamp) * 1000.0;
+  }
+
+  if (odom_found) {
+    odom_delta_ms =
+      timestamp_difference(
+        rclcpp::Time(odom->header.stamp),
+        timestamp) * 1000.0;
+  }
+
+  if (gps_found) {
+    gps_delta_ms =
+      timestamp_difference(
+        rclcpp::Time(gps->header.stamp),
+        timestamp) * 1000.0;
+  }
+
+  // --------------------------------------------------------------
+  // CSV
+  // --------------------------------------------------------------
+
   {
-    std::lock_guard<std::mutex> lock(odom_mutex_);
-    if (odom_received_) { odom_copy = latest_odom_; odom_found = true; }
+    std::lock_guard<std::mutex> lock(csv_mutex_);
+
+    if (csv_file_.is_open()) {
+
+      auto now =
+        std::chrono::duration_cast<
+          std::chrono::milliseconds>(
+            std::chrono::system_clock::now()
+              .time_since_epoch())
+          .count();
+
+      csv_file_
+        << now << ","
+        << total_fusions_.load() << ","
+        << trigger_source << ","
+        << std::fixed
+        << std::setprecision(9)
+        << timestamp.seconds() << ","
+
+        << camera_found << ","
+        << lidar_found << ","
+        << gps_found << ","
+        << gps_interpolated << ","
+        << imu_found << ","
+        << depth_found << ","
+        << odom_found << ","
+
+        << std::setprecision(4)
+        << camera_delta_ms << ","
+        << lidar_delta_ms << ","
+        << imu_delta_ms << ","
+        << depth_delta_ms << ","
+        << odom_delta_ms << ","
+        << gps_delta_ms << ","
+        << latency_ms
+        << "\n";
+
+      csv_file_.flush();
+    }
   }
 
-  auto t_end = std::chrono::steady_clock::now();
-  double latency_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-
-  publish_synced_output(
-    matched_camera, camera_found, camera_stale,
-    matched_lidar, lidar_found, lidar_stale,
-    gps_output, gps_found, gps_interpolated,
-    imu_copy, imu_found,
-    heading_copy, heading_found,
-    depth_copy, depth_found,
-    odom_copy, odom_found,
-    trigger_source, latency_ms);
-
-  latency_sum_ms_ += latency_ms;
-  latency_count_++;
-  if (latency_count_ >= kLatencyLogInterval) {
-    RCLCPP_INFO(this->get_logger(), "Avg fusion latency over last %d cycles: %.3f ms",
-      latency_count_, (latency_sum_ms_ / latency_count_));
-    latency_sum_ms_ = 0.0;
-    latency_count_ = 0;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Publish Outputs
-// ---------------------------------------------------------------------------
-// Monotonic timestamps are now updated inside find_closest_camera() /
-// find_closest_lidar() themselves (atomically, under their own mutex), so
-// this function only needs to publish and bump counters.
-
-void SyncNode::publish_synced_output(
-  const ImageMsg::ConstSharedPtr & camera_msg, bool camera_found, bool camera_stale,
-  const PointCloudMsg::ConstSharedPtr & lidar_msg, bool lidar_found, bool lidar_stale,
-  const NavSatFixMsg::ConstSharedPtr & gps_msg, bool gps_found, bool gps_interpolated,
-  const ImuMsg::ConstSharedPtr & imu_msg, bool imu_found,
-  const HeadingMsg::ConstSharedPtr & heading_msg, bool heading_found,
-  const ImageMsg::ConstSharedPtr & depth_msg, bool depth_found,
-  const OdometryMsg::ConstSharedPtr & odom_msg, bool odom_found,
-  const std::string & trigger_source,
-  double fusion_latency_ms)
-{
-  if (camera_found && camera_msg) {
-    synced_camera_pub_->publish(*camera_msg);
-    camera_published_++;
-  }
-
-  if (lidar_found && lidar_msg) {
-    synced_lidar_pub_->publish(*lidar_msg);
-    lidar_published_++;
-  }
-
-  if (gps_found && gps_msg) {
-    synced_gps_pub_->publish(*gps_msg);
-    gps_published_++;
-  }
-
-  if (imu_found && imu_msg)         synced_imu_pub_->publish(*imu_msg);
-  if (heading_found && heading_msg) synced_heading_pub_->publish(*heading_msg);
-  if (depth_found && depth_msg)     synced_depth_pub_->publish(*depth_msg);
-  if (odom_found && odom_msg)   synced_odom_pub_->publish(*odom_msg);
+  // --------------------------------------------------------------
+  // Diagnostic status
+  // --------------------------------------------------------------
 
   diagnostic_msgs::msg::DiagnosticStatus status;
-  status.name = "sync_node/fusion_status";
-  status.level = (camera_found && gps_found && lidar_found && !camera_stale && !lidar_stale)
-    ? diagnostic_msgs::msg::DiagnosticStatus::OK
-    : diagnostic_msgs::msg::DiagnosticStatus::WARN;
-  status.message = "Triggered by [" + trigger_source + "]";
 
-  auto add_kv = [&](const std::string & key, const std::string & value) {
-    diagnostic_msgs::msg::KeyValue kv; kv.key = key; kv.value = value;
-    status.values.push_back(kv);
-  };
-  add_kv("trigger_source", trigger_source);
-  add_kv("camera_found", camera_found ? "true" : "false");
-  add_kv("camera_stale", camera_stale ? "true" : "false");
-  add_kv("lidar_found", lidar_found ? "true" : "false");
-  add_kv("lidar_stale", lidar_stale ? "true" : "false");
-  add_kv("gps_found", gps_found ? "true" : "false");
-  add_kv("gps_interpolated", gps_interpolated ? "true" : "false");
-  add_kv("fusion_latency_ms", std::to_string(fusion_latency_ms));
+  status.name =
+    "sync_node/fusion_status";
+
+  bool core_ok =
+    camera_found &&
+    lidar_found &&
+    imu_found &&
+    depth_found &&
+    odom_found;
+
+  status.level =
+    core_ok
+      ? diagnostic_msgs::msg::DiagnosticStatus::OK
+      : diagnostic_msgs::msg::DiagnosticStatus::WARN;
+
+  status.message =
+    "Fusion triggered by " + trigger_source;
+
+  auto add_status =
+    [&](const std::string & key,
+        const std::string & value)
+    {
+      diagnostic_msgs::msg::KeyValue kv;
+      kv.key = key;
+      kv.value = value;
+      status.values.push_back(kv);
+    };
+
+  add_status(
+    "trigger_source",
+    trigger_source);
+
+  add_status(
+    "camera_found",
+    camera_found ? "true" : "false");
+
+  add_status(
+    "lidar_found",
+    lidar_found ? "true" : "false");
+
+  add_status(
+    "gps_found",
+    gps_found ? "true" : "false");
+
+  add_status(
+    "gps_interpolated",
+    gps_interpolated ? "true" : "false");
+
+  add_status(
+    "imu_found",
+    imu_found ? "true" : "false");
+
+  add_status(
+    "depth_found",
+    depth_found ? "true" : "false");
+
+  add_status(
+    "odom_found",
+    odom_found ? "true" : "false");
+
+  add_status(
+    "fusion_latency_ms",
+    std::to_string(latency_ms));
 
   status_pub_->publish(status);
 }
 
+// ================================================================
+// Statistics
+// ================================================================
+
 void SyncNode::log_stats()
 {
-  uint64_t cr = camera_received_.load(), cp = camera_published_.load();
-  uint64_t lr = lidar_received_.load(),  lp = lidar_published_.load();
-  uint64_t gr = gps_received_.load(),    gp = gps_published_.load();
+  uint64_t cr = camera_received_.load();
+  uint64_t lr = lidar_received_.load();
+  uint64_t gr = gps_received_.load();
+  uint64_t ir = imu_received_.load();
+  uint64_t dr = depth_received_.load();
+  uint64_t orr = odom_received_.load();
 
-  RCLCPP_INFO(this->get_logger(),
-    "[NO-JITTER STATS] Camera R/P: %lu/%lu | LiDAR R/P: %lu/%lu | GPS R/P: %lu/%lu",
-    cr, cp, lr, lp, gr, gp);
+  uint64_t cm = camera_matched_.load();
+  uint64_t lm = lidar_matched_.load();
+  uint64_t gm = gps_matched_.load();
+  uint64_t im = imu_matched_.load();
+  uint64_t dm = depth_matched_.load();
+  uint64_t om = odom_matched_.load();
 
-  diagnostic_msgs::msg::DiagnosticStatus stats_msg;
-  stats_msg.name = "sync_node/loss_stats";
-  stats_msg.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+  uint64_t cb = camera_buffer_drops_.load();
+  uint64_t lb = lidar_buffer_drops_.load();
+  uint64_t gb = gps_buffer_drops_.load();
+  uint64_t ib = imu_buffer_drops_.load();
+  uint64_t db = depth_buffer_drops_.load();
+  uint64_t ob = odom_buffer_drops_.load();
 
-  auto add_kv = [&](const std::string & key, uint64_t value) {
-    diagnostic_msgs::msg::KeyValue kv; kv.key = key; kv.value = std::to_string(value);
-    stats_msg.values.push_back(kv);
-  };
-  add_kv("camera_recv", cr); add_kv("camera_pub", cp);
-  add_kv("lidar_recv", lr);  add_kv("lidar_pub", lp);
-  add_kv("gps_recv", gr);    add_kv("gps_pub", gp);
+  double avg_latency = 0.0;
+  double min_latency = 0.0;
+  double max_latency = 0.0;
 
-  loss_stats_pub_->publish(stats_msg);
+  {
+    std::lock_guard<std::mutex> lock(latency_mutex_);
+
+    if (latency_count_ > 0) {
+
+      avg_latency =
+        latency_sum_ms_ /
+        static_cast<double>(latency_count_);
+
+      min_latency = latency_min_ms_;
+      max_latency = latency_max_ms_;
+    }
+  }
+
+  RCLCPP_INFO(
+    get_logger(),
+    "==================================================");
+
+  RCLCPP_INFO(
+    get_logger(),
+    "SYNC STATISTICS");
+
+  RCLCPP_INFO(
+    get_logger(),
+    "Fusions: %lu",
+    total_fusions_.load());
+
+  RCLCPP_INFO(
+    get_logger(),
+    "Camera : recv=%lu matched=%lu buffer_drops=%lu",
+    cr, cm, cb);
+
+  RCLCPP_INFO(
+    get_logger(),
+    "LiDAR  : recv=%lu matched=%lu buffer_drops=%lu",
+    lr, lm, lb);
+
+  RCLCPP_INFO(
+    get_logger(),
+    "GPS    : recv=%lu matched=%lu buffer_drops=%lu",
+    gr, gm, gb);
+
+  RCLCPP_INFO(
+    get_logger(),
+    "IMU    : recv=%lu matched=%lu buffer_drops=%lu",
+    ir, im, ib);
+
+  RCLCPP_INFO(
+    get_logger(),
+    "Depth  : recv=%lu matched=%lu buffer_drops=%lu",
+    dr, dm, db);
+
+  RCLCPP_INFO(
+    get_logger(),
+    "Odom   : recv=%lu matched=%lu buffer_drops=%lu",
+    orr, om, ob);
+
+  RCLCPP_INFO(
+    get_logger(),
+    "GPS direct=%lu | interpolated=%lu",
+    gps_direct_count_.load(),
+    gps_interpolated_count_.load());
+
+  RCLCPP_INFO(
+    get_logger(),
+    "Fusion latency: avg=%.3f ms | min=%.3f ms | max=%.3f ms",
+    avg_latency,
+    min_latency,
+    max_latency);
+
+  RCLCPP_INFO(
+    get_logger(),
+    "==================================================");
+
+  // --------------------------------------------------------------
+  // Diagnostic statistics
+  // --------------------------------------------------------------
+
+  diagnostic_msgs::msg::DiagnosticStatus msg;
+
+  msg.name = "sync_node/statistics";
+
+  msg.level =
+    diagnostic_msgs::msg::DiagnosticStatus::OK;
+
+  msg.message =
+    "Synchronization statistics";
+
+  auto add =
+    [&](const std::string & key,
+        uint64_t value)
+    {
+      diagnostic_msgs::msg::KeyValue kv;
+      kv.key = key;
+      kv.value = std::to_string(value);
+      msg.values.push_back(kv);
+    };
+
+  add("camera_received", cr);
+  add("camera_matched", cm);
+  add("camera_buffer_drops", cb);
+
+  add("lidar_received", lr);
+  add("lidar_matched", lm);
+  add("lidar_buffer_drops", lb);
+
+  add("gps_received", gr);
+  add("gps_matched", gm);
+  add("gps_buffer_drops", gb);
+
+  add("imu_received", ir);
+  add("imu_matched", im);
+  add("imu_buffer_drops", ib);
+
+  add("depth_received", dr);
+  add("depth_matched", dm);
+  add("depth_buffer_drops", db);
+
+  add("odom_received", orr);
+  add("odom_matched", om);
+  add("odom_buffer_drops", ob);
+
+  add(
+    "gps_direct",
+    gps_direct_count_.load());
+
+  add(
+    "gps_interpolated",
+    gps_interpolated_count_.load());
+
+  loss_stats_pub_->publish(msg);
 }
 
 }  // namespace sync_node_pkg

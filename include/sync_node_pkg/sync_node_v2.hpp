@@ -9,7 +9,7 @@
 #include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/camera_info.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-#include <geometry_msgs/msg/quaternion_stamped.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <diagnostic_msgs/msg/key_value.hpp>
 
@@ -42,7 +42,7 @@ private:
   using NavSatFixMsg = sensor_msgs::msg::NavSatFix;
   using ImuMsg = sensor_msgs::msg::Imu;
   using OdometryMsg = nav_msgs::msg::Odometry;
-  using HeadingMsg = geometry_msgs::msg::QuaternionStamped;
+  using VelMsg = geometry_msgs::msg::TwistStamped;
   using CameraInfoMsg = sensor_msgs::msg::CameraInfo;
 
   // ============================================================
@@ -55,7 +55,7 @@ private:
   void imu_callback(const ImuMsg::SharedPtr msg);
   void depth_callback(const ImageMsg::SharedPtr msg);
   void odom_callback(const OdometryMsg::SharedPtr msg);
-  void heading_callback(const HeadingMsg::SharedPtr msg);
+  void vel_callback(const VelMsg::SharedPtr msg);
   void rgb_raw_camera_info_callback(const CameraInfoMsg::SharedPtr msg);
   void stereo_callback(const ImageMsg::SharedPtr msg);
 
@@ -69,7 +69,7 @@ private:
 
   // ============================================================
   // Matching - All sensors match to depth timestamp
-  // (GPS and heading use HOLD mode: latest received value,
+  // (GPS and vel use HOLD mode: latest received value,
   //  no time-delta cutoff - see trigger_fusion())
   // ============================================================
 
@@ -121,7 +121,7 @@ private:
   rclcpp::Subscription<ImuMsg>::SharedPtr imu_sub_;
   rclcpp::Subscription<ImageMsg>::SharedPtr depth_sub_;
   rclcpp::Subscription<OdometryMsg>::SharedPtr odom_sub_;
-  rclcpp::Subscription<HeadingMsg>::SharedPtr heading_sub_;
+  rclcpp::Subscription<VelMsg>::SharedPtr vel_sub_;
   rclcpp::Subscription<CameraInfoMsg>::SharedPtr rgb_raw_camera_info_sub_;
   rclcpp::Subscription<ImageMsg>::SharedPtr stereo_sub_;
 
@@ -135,7 +135,7 @@ private:
   rclcpp::Publisher<ImuMsg>::SharedPtr synced_imu_pub_;
   rclcpp::Publisher<ImageMsg>::SharedPtr synced_depth_pub_;
   rclcpp::Publisher<OdometryMsg>::SharedPtr synced_odom_pub_;
-  rclcpp::Publisher<HeadingMsg>::SharedPtr synced_heading_pub_;
+  rclcpp::Publisher<VelMsg>::SharedPtr synced_vel_pub_;
   rclcpp::Publisher<CameraInfoMsg>::SharedPtr synced_rgb_raw_camera_info_pub_;
   rclcpp::Publisher<ImageMsg>::SharedPtr synced_stereo_pub_;
 
@@ -155,13 +155,13 @@ private:
   rclcpp::CallbackGroup::SharedPtr imu_cb_group_;
   rclcpp::CallbackGroup::SharedPtr depth_cb_group_;
   rclcpp::CallbackGroup::SharedPtr odom_cb_group_;
-  rclcpp::CallbackGroup::SharedPtr heading_cb_group_;
+  rclcpp::CallbackGroup::SharedPtr vel_cb_group_;
   rclcpp::CallbackGroup::SharedPtr rgb_raw_camera_info_cb_group_;
   rclcpp::CallbackGroup::SharedPtr stereo_cb_group_;
 
   // ============================================================
   // Buffers
-  // (GPS and heading are NOT buffered - they use single
+  // (GPS and vel are NOT buffered - they use single
   //  "latest value" hold-mode slots instead, see below)
   // ============================================================
 
@@ -179,13 +179,13 @@ private:
   std::mutex imu_mutex_;
   std::mutex depth_mutex_;
   std::mutex odom_mutex_;
-  std::mutex heading_mutex_;
+  std::mutex vel_mutex_;
   std::mutex rgb_raw_camera_info_mutex_;
   std::mutex stereo_mutex_;
   std::mutex fusion_mutex_;
 
   // ============================================================
-  // Hold-mode latest values (GPS + heading)
+  // Hold-mode latest values (GPS + vel)
   //
   // Both repeat their most recently received value on every
   // depth-triggered fusion until a new message arrives. No
@@ -197,8 +197,12 @@ private:
   NavSatFixMsg::ConstSharedPtr latest_gps_;
   bool gps_received_flag_{false};
 
-  HeadingMsg::ConstSharedPtr latest_heading_;
-  bool heading_received_{false};
+  // Last GPS message actually consumed by a fusion cycle - used to
+  // detect whether a given fusion got a fresh fix or reused (held) one
+  NavSatFixMsg::ConstSharedPtr last_fused_gps_;
+
+  VelMsg::ConstSharedPtr latest_vel_;
+  bool vel_received_{false};
 
   // ============================================================
   // Parameters
@@ -235,17 +239,18 @@ private:
   std::atomic<uint64_t> imu_received_{0};
   std::atomic<uint64_t> depth_received_{0};
   std::atomic<uint64_t> odom_received_{0};
-  std::atomic<uint64_t> heading_received_count_{0};
+  std::atomic<uint64_t> vel_received_count_{0};
   std::atomic<uint64_t> rgb_raw_camera_info_received_{0};
   std::atomic<uint64_t> stereo_received_{0};
 
   std::atomic<uint64_t> camera_matched_{0};
   std::atomic<uint64_t> lidar_matched_{0};
   std::atomic<uint64_t> gps_matched_{0};
+  std::atomic<uint64_t> gps_reused_{0};
   std::atomic<uint64_t> imu_matched_{0};
   std::atomic<uint64_t> depth_matched_{0};
   std::atomic<uint64_t> odom_matched_{0};
-  std::atomic<uint64_t> heading_matched_{0};
+  std::atomic<uint64_t> vel_matched_{0};
   std::atomic<uint64_t> rgb_raw_camera_info_matched_{0};
   std::atomic<uint64_t> stereo_matched_{0};
 
